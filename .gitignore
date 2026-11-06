@@ -1,0 +1,8 @@
+.env
+secrets/
+/gitrelay
+/bin/
+/coverage.out
+/cache/
+*.test
+.DS_Store

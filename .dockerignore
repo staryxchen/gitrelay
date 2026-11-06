@@ -1,0 +1,8 @@
+.git
+.env
+secrets
+cache
+bin
+gitrelay
+coverage.out
+*.test
