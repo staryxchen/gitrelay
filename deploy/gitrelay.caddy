@@ -1,0 +1,26 @@
+relay.example.com {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+
+	log {
+		level ERROR
+	}
+
+	@allowed remote_ip <ALLOWED_CLIENT_IP>
+	handle @allowed {
+		@internal path /healthz /metrics
+		respond @internal 404
+
+		reverse_proxy 127.0.0.1:8080 {
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 70s
+			}
+		}
+	}
+	handle {
+		abort
+	}
+}
