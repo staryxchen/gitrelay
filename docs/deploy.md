@@ -29,7 +29,15 @@ install -m 0644 gitrelay.service /etc/systemd/system/gitrelay.service
 systemctl daemon-reload
 systemctl enable --now gitrelay
 systemctl status gitrelay --no-pager
-/usr/local/bin/gitrelay healthcheck
+(
+  if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi
+  ok=0
+  for _ in $(seq 1 20); do
+    if /usr/local/bin/gitrelay healthcheck; then ok=1; break; fi
+    sleep 0.5
+  done
+  [ "$ok" -eq 1 ]
+)
 ```
 
 服务默认监听 `127.0.0.1:8080`，不需要任何环境变量就能启动。如果需要调整限流或监听端口，参考 `deploy/gitrelay.env.example` 创建 `/etc/gitrelay/gitrelay.env`，然后执行 `systemctl restart gitrelay`。
@@ -143,13 +151,21 @@ install -m 0755 "${TMP_DIR}/${BIN}" /usr/local/bin/gitrelay.new
 mv -f /usr/local/bin/gitrelay.new /usr/local/bin/gitrelay
 ```
 
-5. 重启服务，确认进程存活、生效版本与回环健康检查全部通过后清理临时目录（若存在 `/etc/gitrelay/gitrelay.env` 则自动在子 shell 中加载自定义 `LISTEN_ADDR`）：
+5. `gitrelay.service` 使用 `Type=simple`，`systemctl restart gitrelay` 会在进程完成监听端口绑定前返回。若存在 `/etc/gitrelay/gitrelay.env`，子 shell 会先加载其中的自定义 `LISTEN_ADDR`。重启服务，核对生效版本并轮询回环健康检查，确认进程存活后再清理临时目录：
 
 ```sh
 systemctl restart gitrelay
-systemctl is-active --quiet gitrelay
 /usr/local/bin/gitrelay --version
-(if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi; /usr/local/bin/gitrelay healthcheck)
+(
+  if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi
+  ok=0
+  for _ in $(seq 1 20); do
+    if /usr/local/bin/gitrelay healthcheck; then ok=1; break; fi
+    sleep 0.5
+  done
+  [ "$ok" -eq 1 ]
+)
+systemctl is-active --quiet gitrelay
 rm -rf "${TMP_DIR}"
 ```
 
@@ -159,6 +175,14 @@ rm -rf "${TMP_DIR}"
 install -m 0755 /usr/local/bin/gitrelay.bak /usr/local/bin/gitrelay.rollback
 mv -f /usr/local/bin/gitrelay.rollback /usr/local/bin/gitrelay
 systemctl restart gitrelay
+(
+  if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi
+  ok=0
+  for _ in $(seq 1 20); do
+    if /usr/local/bin/gitrelay healthcheck; then ok=1; break; fi
+    sleep 0.5
+  done
+  [ "$ok" -eq 1 ]
+)
 systemctl is-active --quiet gitrelay
-(if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi; /usr/local/bin/gitrelay healthcheck)
 ```
