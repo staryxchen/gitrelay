@@ -22,7 +22,16 @@ journalctl -u gitrelay -n 50 --no-pager
 curl -s http://127.0.0.1:8080/metrics
 ```
 
-`deploy/gitrelay.service` 对 `journald` 输出做了限速（`LogRateLimitIntervalSec=30s`、`LogRateLimitBurst=200`）。小容量磁盘的机器建议同时检查 `/etc/systemd/journald.conf` 里的 `SystemMaxUse` 是否设置了上限。
+`deploy/gitrelay.service` 对 `journald` 输出做了限速（`LogRateLimitIntervalSec=30s`、`LogRateLimitBurst=200`）。查看当前日志总占用与生效上限可执行：
+
+```sh
+journalctl --disk-usage
+systemd-analyze cat-config systemd/journald.conf | grep -vE '^[[:space:]]*(#|$)'
+```
+
+如需收紧磁盘上限与保留天数，按 [服务器部署](deploy.md) 中的步骤配置 `/etc/systemd/journald.conf.d/99-limit.conf`。
+
+如果配置新域名并重载宿主机 Caddy 后出现偶发 TLS 握手失败（`tlsv1 alert internal error`），优先用 `ss -tlnp | grep :443` 核查是否残留多条 `*:443` 监听套接字，处理方式见 [服务器部署](deploy.md)。
 
 ## 日志字段
 

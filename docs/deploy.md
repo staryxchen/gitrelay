@@ -56,7 +56,32 @@ systemctl reload caddy
 
 如果线上 `/etc/caddy/Caddyfile` 原本写了自定义的 `:80` 重定向块，重载前用 `caddy adapt --config /etc/caddy/Caddyfile --pretty` 确认新域名的路由和证书策略正常。
 
-## 3. 验收
+如果宿主机 Caddy 安装了第三方 `listener_wrappers` 插件，热重载后检查 443 端口监听数量：
+
+```sh
+ss -tlnp | grep :443
+```
+
+正常情况下 `:443` 只应有一条监听记录。如果同一个 Caddy 进程同时出现多条 `*:443` 监听，说明热重载未释放旧套接字，新旧配置会在 `SO_REUSEPORT` 下随机分流，导致新域名 TLS 握手偶发 `tlsv1 alert internal error`（`no certificate available`）。确认 `caddy validate` 通过且现有插件状态已持久化到磁盘后，执行一次 `systemctl restart caddy` 清理旧套接字，再复查 `ss -tlnp | grep :443`。
+
+## 3. 限制 journald 日志容量（建议）
+
+`gitrelay` 与宿主机 Caddy 都通过标准输出把日志交给 `systemd-journald`。系统默认按根分区容量的 10% 且封顶 4 GiB 轮转，小容量 VPS 建议显式收紧上限：
+
+```sh
+mkdir -p /etc/systemd/journald.conf.d
+cat <<'EOF' > /etc/systemd/journald.conf.d/99-limit.conf
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=32M
+MaxRetentionSec=14day
+EOF
+systemctl restart systemd-journald
+journalctl --vacuum-size=200M --vacuum-time=14d
+journalctl --disk-usage
+```
+
+## 4. 验收
 
 在白名单机器上测试克隆，确认不带 `.git` 和带 `.git` 都能正常工作：
 
