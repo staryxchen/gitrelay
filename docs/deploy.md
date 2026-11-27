@@ -21,7 +21,7 @@ apt-get install -y caddy
 
 ## 1. 安装二进制与 systemd 服务
 
-先在本地按 [本地构建与验证](local-dev.md) 编译出 `bin/gitrelay`，连同 `deploy/gitrelay.service` 上传到 Linux 服务器后执行：
+先在本地按 [本地构建与验证](local-dev.md) 编译出 `bin/gitrelay`，连同 `deploy/gitrelay.service` 上传到 Linux 服务器后执行。没有 Go 环境的服务器可先执行[第 5 节](#5-从-github-release-校验并升级)的步骤 1 至 4 将预编译二进制校验并安装到 `/usr/local/bin/gitrelay`（随后执行 `rm -rf "${TMP_DIR}"` 清理临时目录），再跳过下面第一行，直接安装 `gitrelay.service` 并启用服务：
 
 ```sh
 install -m 0755 gitrelay /usr/local/bin/gitrelay
@@ -95,3 +95,70 @@ git -C REPO fetch --prune
 - 白名单机器访问 `https://relay.example.com/healthz` 和 `https://relay.example.com/metrics` 返回 `404`。
 - 非白名单公网 IP 连接 `https://relay.example.com` 被直接断开。
 - 尝试 `git push` 被拒绝。
+
+## 5. 从 GitHub Release 校验并升级
+
+已按第 1 节安装 `gitrelay.service` 的无 Go 环境 Linux 服务器，可直接下载 GitHub Release 构建的静态二进制完成原地升级。
+
+1. 指定目标版本 `VERSION`（正式版填 `v0.1.0` 等标签，每日构建填 `nightly`），映射当前机器架构，并将二进制与 `SHA256SUMS` 下载到独立临时目录：
+
+```sh
+VERSION="v0.1.0"
+case "$(uname -m)" in
+  x86_64) ARCH="amd64" ;;
+  aarch64) ARCH="arm64" ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+BIN="gitrelay-linux-${ARCH}"
+BASE_URL="https://github.com/staryxchen/gitrelay/releases/download/${VERSION}"
+TMP_DIR="$(mktemp -d)"
+
+curl -fsSL -o "${TMP_DIR}/${BIN}" "${BASE_URL}/${BIN}"
+curl -fsSL -o "${TMP_DIR}/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
+```
+
+2. `SHA256SUMS` 同时包含 `amd64` 与 `arm64` 条目。用 `awk` 精确提取当前架构单行后交给 `sha256sum -c -` 校验，缺失、重复或字节损坏都会返回非零退出码：
+
+```sh
+(
+  cd "${TMP_DIR}" &&
+  awk -v bin="${BIN}" '$2 == bin || $2 == "*" bin { line = $0; n++ } END { if (n == 1) print line; else exit 1 }' SHA256SUMS | sha256sum -c -
+)
+```
+
+3. 升级前不要对线上旧二进制执行 `/usr/local/bin/gitrelay --version`，早期版本未实现 `--version` 参数，直接运行会尝试启动服务。只对刚通过校验的新二进制赋予执行权限并预检版本输出：
+
+```sh
+chmod 0755 "${TMP_DIR}/${BIN}"
+"${TMP_DIR}/${BIN}" --version
+```
+
+4. 若旧二进制已存在，先备份为 `/usr/local/bin/gitrelay.bak`。随后用 `install` 写入同目录临时文件 `/usr/local/bin/gitrelay.new`，再用 `mv -f` 在同一文件系统内原子替换 `/usr/local/bin/gitrelay`，避免直接覆盖运行中进程触发 `ETXTBSY` 或留下半写文件：
+
+```sh
+if [ -f /usr/local/bin/gitrelay ]; then
+  install -m 0755 /usr/local/bin/gitrelay /usr/local/bin/gitrelay.bak
+fi
+install -m 0755 "${TMP_DIR}/${BIN}" /usr/local/bin/gitrelay.new
+mv -f /usr/local/bin/gitrelay.new /usr/local/bin/gitrelay
+```
+
+5. 重启服务，确认进程存活、生效版本与回环健康检查全部通过后清理临时目录（若存在 `/etc/gitrelay/gitrelay.env` 则自动在子 shell 中加载自定义 `LISTEN_ADDR`）：
+
+```sh
+systemctl restart gitrelay
+systemctl is-active --quiet gitrelay
+/usr/local/bin/gitrelay --version
+(if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi; /usr/local/bin/gitrelay healthcheck)
+rm -rf "${TMP_DIR}"
+```
+
+6. 如果升级后验证失败，用备份文件原子回滚并重启服务：
+
+```sh
+install -m 0755 /usr/local/bin/gitrelay.bak /usr/local/bin/gitrelay.rollback
+mv -f /usr/local/bin/gitrelay.rollback /usr/local/bin/gitrelay
+systemctl restart gitrelay
+systemctl is-active --quiet gitrelay
+(if [ -f /etc/gitrelay/gitrelay.env ]; then set -a; . /etc/gitrelay/gitrelay.env; fi; /usr/local/bin/gitrelay healthcheck)
+```

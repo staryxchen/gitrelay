@@ -2,7 +2,6 @@
 set -euo pipefail
 
 TARGETS=("linux/amd64" "linux/arm64")
-LDFLAGS="-s -w"
 
 smoke=false
 if [[ "${1:-}" == "--smoke" ]]; then
@@ -33,6 +32,36 @@ case "$out_dir" in
 esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repo_root"
+
+version="${GITRELAY_VERSION:-dev}"
+if [[ -n "${GITRELAY_COMMIT:-}" ]]; then
+  commit="$GITRELAY_COMMIT"
+elif head_sha="$(git rev-parse HEAD 2>/dev/null)"; then
+  commit="$head_sha"
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    commit="${commit}-dirty"
+  fi
+else
+  commit="unknown"
+fi
+build_time="${GITRELAY_BUILD_TIME:-$(TZ=UTC date '+%Y-%m-%dT%H:%M:%SZ')}"
+
+if [[ ! "$version" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+  echo "error: GITRELAY_VERSION must match ^[0-9A-Za-z._+-]+$, got '${version}'" >&2
+  exit 1
+fi
+if [[ ! "$commit" =~ ^([0-9a-fA-F]{7,40}(-dirty)?|unknown)$ ]]; then
+  echo "error: GITRELAY_COMMIT must match ^([0-9a-fA-F]{7,40}(-dirty)?|unknown)$, got '${commit}'" >&2
+  exit 1
+fi
+if [[ ! "$build_time" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z|unknown)$ ]]; then
+  echo "error: GITRELAY_BUILD_TIME must match UTC RFC3339 or 'unknown', got '${build_time}'" >&2
+  exit 1
+fi
+
+LDFLAGS="-s -w -X main.version=${version} -X main.commit=${commit} -X main.buildTime=${build_time}"
+
 stage_dir="$(mktemp -d)"
 server_pid=""
 
@@ -83,8 +112,6 @@ pick_free_port() {
   return 1
 }
 
-cd "$repo_root"
-
 built_names=()
 for target in "${TARGETS[@]}"; do
   os="${target%/*}"
@@ -131,6 +158,30 @@ if [[ "$smoke" == true && "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" 
   port="$(pick_free_port)"
   listen_addr="127.0.0.1:${port}"
   smoke_bin="${stage_dir}/gitrelay-linux-amd64"
+  expected_version="gitrelay ${version} (commit ${commit}, built ${build_time})"
+
+  got_flag="$("$smoke_bin" --version)"
+  if [[ "$got_flag" != "$expected_version" ]]; then
+    echo "error: smoke --version output '${got_flag}' did not match '${expected_version}'" >&2
+    exit 1
+  fi
+
+  got_sub="$("$smoke_bin" version)"
+  if [[ "$got_sub" != "$expected_version" ]]; then
+    echo "error: smoke version output '${got_sub}' did not match '${expected_version}'" >&2
+    exit 1
+  fi
+
+  bad_rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    LISTEN_ADDR="$listen_addr" timeout 5 "$smoke_bin" --unknown-flag >/dev/null 2>&1 || bad_rc=$?
+  else
+    LISTEN_ADDR="$listen_addr" "$smoke_bin" --unknown-flag >/dev/null 2>&1 || bad_rc=$?
+  fi
+  if (( bad_rc != 2 )); then
+    echo "error: smoke expected exit code 2 for --unknown-flag, got ${bad_rc}" >&2
+    exit 1
+  fi
 
   LISTEN_ADDR="$listen_addr" "$smoke_bin" >/dev/null 2>&1 &
   server_pid="$!"

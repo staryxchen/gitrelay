@@ -31,7 +31,10 @@ jobs:
       - run: go test -race -count=1 ./...
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
       - run: bash -n scripts/*.sh
-      - run: ./scripts/build-release.sh --smoke dist
+      - env:
+          GITRELAY_VERSION: ${{ github.ref_name }}
+          GITRELAY_COMMIT: ${{ github.sha }}
+        run: ./scripts/build-release.sh --smoke dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist

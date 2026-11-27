@@ -57,4 +57,7 @@ jobs:
           check-latest: true
           cache: false
       - run: bash -n scripts/*.sh
-      - run: ./scripts/build-release.sh --smoke dist
+      - env:
+          GITRELAY_VERSION: dev
+          GITRELAY_COMMIT: ${{ github.sha }}
+        run: ./scripts/build-release.sh --smoke dist
