@@ -91,7 +91,13 @@ journalctl --disk-usage
 
 ## 4. 验收
 
-在白名单机器上测试克隆，确认不带 `.git` 和带 `.git` 都能正常工作：
+在白名单机器上可以直接运行仓库自带的端到端校验脚本，一次性验证克隆（不带 `.git` / 带 `.git` / 浅克隆）、`/healthz` 与 `/metrics` 隐藏、`CONNECT` 与归档下载拒绝，以及 `git push` 只读边界：
+
+```sh
+./scripts/verify-e2e.sh https://relay.example.com
+```
+
+也可以手动分步测试克隆，确认不带 `.git` 和带 `.git` 都能正常工作：
 
 ```sh
 git clone https://relay.example.com/https://github.com/OWNER/REPO
