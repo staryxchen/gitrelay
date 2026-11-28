@@ -47,6 +47,7 @@ github.com
 
 ## 文档
 
-- [本地构建与验证](docs/local-dev.md)
+- [开发与 AI 协作指南](AGENTS.md)
+- [架构设计与核心取舍](docs/design.md)
 - [服务器部署（systemd 与 Caddy）](docs/deploy.md)
 - [配置、日志与指标参考](docs/operations.md)

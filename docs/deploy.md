@@ -21,7 +21,7 @@ apt-get install -y caddy
 
 ## 1. 安装二进制与 systemd 服务
 
-先在本地按 [本地构建与验证](local-dev.md) 编译出 `bin/gitrelay`，连同 `deploy/gitrelay.service` 上传到 Linux 服务器后执行。没有 Go 环境的服务器可先执行[第 5 节](#5-从-github-release-校验并升级)的步骤 1 至 4 将预编译二进制校验并安装到 `/usr/local/bin/gitrelay`（随后执行 `rm -rf "${TMP_DIR}"` 清理临时目录），再跳过下面第一行，直接安装 `gitrelay.service` 并启用服务：
+先在本地按 [AGENTS.md](../AGENTS.md) 编译出 `bin/gitrelay`，连同 `deploy/gitrelay.service` 上传到 Linux 服务器后执行。没有 Go 环境的服务器可先执行[第 5 节](#5-从-github-release-校验并升级)的步骤 1 至 4 将预编译二进制校验并安装到 `/usr/local/bin/gitrelay`（随后执行 `rm -rf "${TMP_DIR}"` 清理临时目录），再跳过下面第一行，直接安装 `gitrelay.service` 并启用服务：
 
 ```sh
 install -m 0755 gitrelay /usr/local/bin/gitrelay
