@@ -5,6 +5,14 @@ relay.example.com {
 
 	log {
 		level ERROR
+		format filter {
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>Proxy-Authorization delete
+				resp_headers>Set-Cookie delete
+			}
+		}
 	}
 
 	@allowed remote_ip <ALLOWED_CLIENT_IP>

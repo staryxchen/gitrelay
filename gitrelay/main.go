@@ -202,7 +202,7 @@ func run(log *slog.Logger, info buildInfo) error {
 	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
-	log.Info("service started", "listen", c.Listen, "version", info.Version, "commit", info.Commit, "built", info.BuildTime)
+	log.Info("service started", "listen", c.Listen, "version", info.Version, "commit", info.Commit, "built", info.BuildTime, "auth_passthrough", c.AuthPassthrough)
 	select {
 	case err := <-done:
 		return err

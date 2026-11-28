@@ -24,7 +24,7 @@
    - `CONNECT` 与非 `GET`/`POST` 请求必须在限流和并发槽之前直接返回 `405 Method Not Allowed` 与 `Allow: GET, POST`。
    - 上游拨号必须先解析全部 DNS 记录，拒绝任意非公网地址后直连数字 IP，防止 DNS rebinding 与 SSRF。
    - 禁止盲目跟随上游重定向，任何未来放开的跳转必须严格校验目标仍在 `https://github.com` 合法路径内。
-5. **零服务端凭据**：绝不在服务端配置或存储常驻 GitHub PAT。后续私有仓库或写入能力必须通过显式关闭默认的开关启用客户端 `Authorization` / `WWW-Authenticate` 透传，且严禁把 `Authorization` 或 `Cookie` 写入任何日志或错误响应。
+5. **零服务端凭据**：绝不在服务端配置或存储常驻 GitHub PAT。私有仓库只读拉取通过默认关闭的 `ENABLE_AUTH_PASSTHROUGH`（默认 `false`）按需透传客户端 `Authorization`（仅限 `https://github.com`）与上游 `401` `WWW-Authenticate`，后续写入能力也必须共用同一边界，且严禁把 `Authorization` 或 `Cookie` 写入任何日志或错误响应。
 6. **O(1) 轻量观测**：结构化 JSON 日志不输出原始 URL、查询参数与请求头；`/metrics` 仅暴露固定 `atomic.Int64` 标量，禁止引入按仓库或 IP 展开的高基数标签。
 7. **禁止泄露私有环境信息**：仓库代码、文档、脚本、测试、PR 与 Issue 中严禁出现真实个人域名、VPS IP、白名单出口 IP、自定义 SSH 端口或凭据，统一使用 `relay.example.com` 与 `<ALLOWED_CLIENT_IP>` 占位。
 
@@ -41,7 +41,7 @@ bash -n scripts/*.sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/gitrelay ./gitrelay
 ```
 
-集成测试会在临时目录用本机 `git` 与 `git-http-backend` 创建 60 分支仓库，覆盖真实 `git clone`、增量 `git fetch`、`Content-Encoding: gzip` 请求体转发与 `git push` 拦截。
+集成测试会在临时目录用本机 `git` 与 `git-http-backend` 创建 60 分支仓库，覆盖真实 `git clone`、增量 `git fetch`、`Content-Encoding: gzip` 请求体转发、私有仓库 `401 -> 200` 凭据透传（`credential.helper`）、默认关闭时的凭据剥离、日志零泄漏校验与 `git push` 拦截。
 
 ### 本地回环冒烟检查
 
