@@ -23,7 +23,7 @@
    - 仅放行校验通过的 `https://github.com:443` Git Smart HTTP 端点，默认保持只读（拒绝 `git-receive-pack`、Release、Archive、Raw 等路径）。
    - `CONNECT` 与非 `GET`/`POST` 请求必须在限流和并发槽之前直接返回 `405 Method Not Allowed` 与 `Allow: GET, POST`。
    - 上游拨号必须先解析全部 DNS 记录，拒绝任意非公网地址后直连数字 IP，防止 DNS rebinding 与 SSRF。
-   - 禁止盲目跟随上游重定向，任何未来放开的跳转必须严格校验目标仍在 `https://github.com` 合法路径内。
+   - 不在服务端跟随上游重定向。仅 `GET /info/refs?service=git-upload-pack` 的 `301`、`302`、`307`、`308`，且单个 `Location` 经 `parseRedirectTarget` 校验后仍是 `https://github.com` 只读路径时，改写为中继根相对路径返回。源站相对路径只拼接 `https://github.com`，不使用 `url.ResolveReference`。自环、跨主机、`POST` 及其他 `3xx` 返回 `502`。禁止为重放跳转而缓冲 `POST` 请求体。
 5. **零服务端凭据**：绝不在服务端配置或存储常驻 GitHub PAT。私有仓库只读拉取通过默认关闭的 `ENABLE_AUTH_PASSTHROUGH`（默认 `false`）按需透传客户端 `Authorization`（仅限 `https://github.com`）与上游 `401` `WWW-Authenticate`，后续写入能力也必须共用同一边界，且严禁把 `Authorization` 或 `Cookie` 写入任何日志或错误响应。
 6. **O(1) 轻量观测**：结构化 JSON 日志不输出原始 URL、查询参数与请求头；`/metrics` 仅暴露固定 `atomic.Int64` 标量，禁止引入按仓库或 IP 展开的高基数标签。
 7. **禁止泄露私有环境信息**：仓库代码、文档、脚本、测试、PR 与 Issue 中严禁出现真实个人域名、VPS IP、白名单出口 IP、自定义 SSH 端口或凭据，统一使用 `relay.example.com` 与 `<ALLOWED_CLIENT_IP>` 占位。

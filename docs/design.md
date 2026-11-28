@@ -59,3 +59,10 @@
 - **原因与取舍**：低配 VPS 不适合常驻 Prometheus、Grafana 或日志采集代理。固定标量指标保证了无论运行多久、访问多少仓库，进程内存占用都保持 O(1)；`journald` 配合 `LogRateLimit` 与 `SystemMaxUse` 即可防止异常流量写满磁盘。
 - **接受的代价**：无法直接按单个仓库维度聚合历史流量曲线，只能从近期日志按需过滤统计。
 - **重估条件**：当服务转为多人共享并需要按仓库或用户做长期计费/审计报表时，再接入外部时序与日志存储。
+
+## ADR-8 只改写校验过的 info/refs 重定向
+
+- **决策**：`CheckRedirect` 返回 `http.ErrUseLastResponse`。`parseRedirectTarget` 决定能否把这次重定向交回客户端。只接受当前请求是 `GET /info/refs?service=git-upload-pack`，状态码是 `301`、`302`、`307` 或 `308`，且响应里只有一个 `Location`。`Location` 必须是 `https://github.com/...`，或以单个 `/` 开头的源站相对路径。相对路径通过拼接 `https://github.com` 还原，不调用 `url.ResolveReference`，路径里的 `..` 保持原样并在校验时拒绝。还原后的地址走与客户端请求相同的只读路径校验。通过后，服务用相同状态码返回根相对 `Location`，值为 `/https://github.com/<owner>/<repo>.git/info/refs?service=git-upload-pack`，并丢弃上游响应体最多 4 KiB。响应保留 `X-Content-Type-Options`、`Content-Security-Policy`、`Referrer-Policy`，以及值为 `private, no-store` 的 `Cache-Control`。不转发 `Set-Cookie` 和 `WWW-Authenticate`。自环、跨主机、`http`、用户信息、显式端口、片段、额外查询参数、`POST`、多值 `Location` 和其他 `3xx` 都返回 `502`。`error_kind` 为 `upstream_redirect`，自环为 `upstream_redirect_loop`。日志和错误正文都不包含 `Location` 或 `Authorization`。
+- **原因与取舍**：仓库改名或转移后，GitHub 在 `info/refs` 上返回重定向。若在服务端跟随，后续 `POST /git-upload-pack` 必须先缓存请求体才能重放。上限是 `GIT_REQUEST_MAX_BYTES`，默认 32 MiB，最大 1 GiB。这会打破 32 KiB 流式转发，也会超出 `MemoryMax=192M`。把校验后的 `Location` 交回 `git` 后，客户端打印 `warning: redirecting to ...`，并把后续 `POST` 直接发到新仓库。规范化后的 URL 与当前 `info/refs` 相同时立即返回 `502`。两个仓库互相把 `info/refs` 指到对方时，由 `git` 最多跟随 20 次重定向和现有令牌桶的 `429` 终止。进程不保存跳转链，也不把 `Authorization` 发到其他主机。
+- **接受的代价**：`git` 会显示重定向警告，远程 URL 变为中继上的新仓库路径。`POST` 上的 `3xx` 直接返回 `502`，服务端不重放请求体。Git 2.35 在 `401` 早于 `301` 时不会更新仓库基址。私有仓库要先在旧路径返回重定向，再在新路径返回 `401`。
+- **重估条件**：如果 GitHub 改为只在 `POST /git-upload-pack` 上重定向，或必须隐藏客户端的重定向警告，再评估有上限的请求体缓冲。在此之前不在服务端跟随重定向。

@@ -276,9 +276,19 @@ func (h *handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.log.Warn("upstream error response", "action", action, "repo", repo, "status", resp.StatusCode)
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		h.stats.upstreamErrors.Add(1)
-		errorKind = "upstream_redirect"
-		http.Error(w, "unsupported upstream redirect", http.StatusBadGateway)
+		next, redirErr := parseRedirectTarget(target, resp.StatusCode, resp.Header.Values("Location"))
+		if redirErr != nil {
+			h.stats.upstreamErrors.Add(1)
+			errorKind = "upstream_redirect"
+			if errors.Is(redirErr, errRedirectLoop) {
+				errorKind = "upstream_redirect_loop"
+			}
+			http.Error(w, "unsupported upstream redirect", http.StatusBadGateway)
+			return
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		w.Header().Set("Location", next.RelayPath())
+		w.WriteHeader(resp.StatusCode)
 		return
 	}
 	copyResponseHeaders(w.Header(), resp.Header, resp.StatusCode, h.cfg.AuthPassthrough)

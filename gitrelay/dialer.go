@@ -93,7 +93,7 @@ func newUpstreamClient(concurrency int) *http.Client {
 	return &http.Client{
 		Transport: tr,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errors.New("upstream redirects are not supported")
+			return http.ErrUseLastResponse
 		},
 	}
 }

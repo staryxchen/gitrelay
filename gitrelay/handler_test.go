@@ -42,7 +42,7 @@ func localUpstream(t *testing.T, handler http.HandlerFunc) *http.Client {
 	t.Cleanup(tr.CloseIdleConnections)
 	return &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errors.New("upstream redirects are not supported")
+			return http.ErrUseLastResponse
 		},
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			clone := r.Clone(r.Context())
@@ -179,8 +179,11 @@ func TestRejectRedirectAndRedactLogs(t *testing.T) {
 		Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
 	})
 	out := proxyRequest(t, h, "GET", infoRefsPath, nil, "")
-	if out.Code != 502 || strings.Contains(logs.String(), "TOPSECRET") || strings.Contains(logs.String(), "new.git") {
-		t.Fatal("redirect not rejected or log leaked", out.Code, logs.String())
+	blob := logs.String() + out.Body.String() + out.Header().Get("Location")
+	if out.Code != 502 || strings.Contains(blob, "TOPSECRET") || strings.Contains(blob, "new.git") ||
+		!strings.Contains(logs.String(), `"error_kind":"upstream_redirect"`) ||
+		strings.Contains(logs.String(), `upstream_redirect_loop`) {
+		t.Fatal("redirect not rejected or log leaked", out.Code, logs.String(), out.Body.String(), out.Header())
 	}
 }
 
@@ -481,16 +484,19 @@ func TestSentinelCredentialAbsentFromLogsAndErrors(t *testing.T) {
 	sentinelErr := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("dial " + sentinelToken + " " + sentinelEncoded)
 	})}
+	const rewritten = "/https://github.com/o/new.git/info/refs?service=git-upload-pack"
+	const crossHost = "https://evil.example/o/new.git/info/refs?service=git-upload-pack"
 	for _, tt := range []struct {
-		name, path, body, log string
-		client                *http.Client
-		want                  int
+		name, path, body, log, location, absent string
+		client                                  *http.Client
+		want                                    int
 	}{
-		{"400", "/https://github.com/o/r/archive/refs/heads/main.zip", "", "", noUpstream, http.StatusBadRequest},
-		{"401", infoRefsPath, "", "", scriptUpstream(http.StatusUnauthorized, http.Header{"WWW-Authenticate": {`Basic realm="GitHub"`}}, "unauthorized", nil), http.StatusUnauthorized},
-		{"500", infoRefsPath, "", `"msg":"upstream error response"`, scriptUpstream(http.StatusInternalServerError, nil, "upstream", nil), http.StatusInternalServerError},
-		{"502_upstream_error", infoRefsPath, "upstream request failed\n", `"msg":"upstream request failed"`, sentinelErr, http.StatusBadGateway},
-		{"502_redirect", infoRefsPath, "unsupported upstream redirect\n", "", scriptUpstream(http.StatusFound, http.Header{"Location": {"https://github.com/o/new.git/info/refs?service=git-upload-pack"}}, "redirected", nil), http.StatusBadGateway},
+		{"400", "/https://github.com/o/r/archive/refs/heads/main.zip", "", "", "", "", noUpstream, http.StatusBadRequest},
+		{"401", infoRefsPath, "", "", "", "", scriptUpstream(http.StatusUnauthorized, http.Header{"WWW-Authenticate": {`Basic realm="GitHub"`}}, "unauthorized", nil), http.StatusUnauthorized},
+		{"500", infoRefsPath, "", `"msg":"upstream error response"`, "", "", scriptUpstream(http.StatusInternalServerError, nil, "upstream", nil), http.StatusInternalServerError},
+		{"502_upstream_error", infoRefsPath, "upstream request failed\n", `"msg":"upstream request failed"`, "", "", sentinelErr, http.StatusBadGateway},
+		{"302_redirect", infoRefsPath, "", "", rewritten, "", scriptUpstream(http.StatusFound, http.Header{"Location": {"https://github.com/o/new.git/info/refs?service=git-upload-pack"}}, "redirected", nil), http.StatusFound},
+		{"502_redirect", infoRefsPath, "unsupported upstream redirect\n", "", "", crossHost, scriptUpstream(http.StatusFound, http.Header{"Location": {crossHost}}, "redirected", nil), http.StatusBadGateway},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testConfig()
@@ -501,6 +507,9 @@ func TestSentinelCredentialAbsentFromLogsAndErrors(t *testing.T) {
 			if got.Code != tt.want || (tt.body != "" && got.Body.String() != tt.body) {
 				t.Fatalf("code=%d body=%q", got.Code, got.Body.String())
 			}
+			if tt.location != "" && (got.Header().Get("Location") != tt.location || got.Body.String() != "") {
+				t.Fatalf("location=%q body=%q", got.Header().Get("Location"), got.Body.String())
+			}
 			text := logs.String()
 			if !strings.Contains(text, `"msg":"request"`) || (tt.log != "" && !strings.Contains(text, tt.log)) {
 				t.Fatalf("logs=%s", text)
@@ -509,6 +518,110 @@ func TestSentinelCredentialAbsentFromLogsAndErrors(t *testing.T) {
 			if strings.Contains(blob, sentinelToken) || strings.Contains(blob, sentinelEncoded) {
 				t.Fatalf("credential leaked status=%d logs=%s body=%q headers=%v", got.Code, text, got.Body.String(), got.Header())
 			}
+			if tt.absent != "" && (strings.Contains(blob, tt.absent) || got.Header().Get("Location") != "") {
+				t.Fatalf("location leaked status=%d logs=%s body=%q headers=%v", got.Code, text, got.Body.String(), got.Header())
+			}
 		})
+	}
+}
+
+func TestRedirectRewriteAndRejections(t *testing.T) {
+	const (
+		next  = "https://github.com/new/repo.git/info/refs?service=git-upload-pack"
+		relay = "/" + next
+	)
+	security := func(t *testing.T, h http.Header) {
+		t.Helper()
+		if h.Get("X-Content-Type-Options") != "nosniff" ||
+			h.Get("Content-Security-Policy") != "default-src 'none'; sandbox" ||
+			h.Get("Referrer-Policy") != "no-referrer" ||
+			h.Get("Cache-Control") != "private, no-store" ||
+			h.Get("Set-Cookie") != "" || h.Get("WWW-Authenticate") != "" {
+			t.Fatalf("headers=%v", h)
+		}
+	}
+	redirectClient := func(status int, locations []string, body io.Reader) *http.Client {
+		return &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				hdr := http.Header{
+					"Set-Cookie":       {"session=secret"},
+					"WWW-Authenticate": {`Basic realm="upstream"`},
+				}
+				for _, loc := range locations {
+					hdr.Add("Location", loc)
+				}
+				return &http.Response{
+					StatusCode: status, Header: hdr, Body: io.NopCloser(body),
+					ContentLength: -1, Request: r,
+				}, nil
+			}),
+		}
+	}
+	var logs bytes.Buffer
+	h := newHandler(testConfig(), handlerOptions{Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+	errorsOf := func(t *testing.T) string {
+		t.Helper()
+		out := proxyRequest(t, h, http.MethodGet, "/metrics", nil, "")
+		for _, line := range strings.Split(out.Body.String(), "\n") {
+			if strings.HasPrefix(line, "gitrelay_upstream_errors_total ") {
+				return line
+			}
+		}
+		t.Fatal("missing gitrelay_upstream_errors_total", out.Body.String())
+		return ""
+	}
+	for _, tt := range []struct {
+		code int
+		loc  string
+	}{
+		{http.StatusMovedPermanently, "/new/repo/info/refs?service=git-upload-pack"},
+		{http.StatusPermanentRedirect, "https://github.com/new/repo/info/refs?service=git-upload-pack"},
+	} {
+		body := &countingReader{r: bytes.NewReader(bytes.Repeat([]byte("x"), 8<<10))}
+		h.client = redirectClient(tt.code, []string{tt.loc}, body)
+		got := proxyRequest(t, h, http.MethodGet, infoRefsPath, nil, "")
+		if got.Code != tt.code || got.Header().Get("Location") != relay || got.Body.Len() != 0 || body.n != 4<<10 {
+			t.Fatalf("code=%d loc=%q body=%d read=%d wantCode=%d", got.Code, got.Header().Get("Location"), got.Body.Len(), body.n, tt.code)
+		}
+		security(t, got.Header())
+	}
+	if errorsOf(t) != "gitrelay_upstream_errors_total 0" {
+		t.Fatal("valid rewrites counted as upstream errors")
+	}
+
+	h.client = redirectClient(http.StatusMovedPermanently, []string{"https://github.com/o/r.git/info/refs?service=git-upload-pack"}, strings.NewReader("loop"))
+	looped := proxyRequest(t, h, http.MethodGet, infoRefsPath, nil, "")
+	if looped.Code != http.StatusBadGateway || looped.Body.String() != "unsupported upstream redirect\n" || looped.Header().Get("Location") != "" {
+		t.Fatalf("loop code=%d body=%q loc=%q", looped.Code, looped.Body.String(), looped.Header().Get("Location"))
+	}
+	security(t, looped.Header())
+
+	h.client = redirectClient(http.StatusFound, []string{next, "https://github.com/other/repo.git/info/refs?service=git-upload-pack"}, strings.NewReader("multi"))
+	multi := proxyRequest(t, h, http.MethodGet, infoRefsPath, nil, "")
+	if multi.Code != http.StatusBadGateway || multi.Body.String() != "unsupported upstream redirect\n" || strings.Contains(multi.Body.String()+fmt.Sprint(multi.Header()), "other/repo") {
+		t.Fatalf("multi code=%d body=%q headers=%v", multi.Code, multi.Body.String(), multi.Header())
+	}
+
+	postHdr := http.Header{"Content-Type": {"application/x-git-upload-pack-request"}}
+	h.client = redirectClient(http.StatusTemporaryRedirect, []string{next}, strings.NewReader("post"))
+	posted := proxyRequest(t, h, http.MethodPost, uploadPackPath, postHdr, "0000")
+	if posted.Code != http.StatusBadGateway || posted.Body.String() != "unsupported upstream redirect\n" || posted.Header().Get("Location") != "" {
+		t.Fatalf("post code=%d body=%q loc=%q", posted.Code, posted.Body.String(), posted.Header().Get("Location"))
+	}
+	loops, redirects := 0, 0
+	for _, line := range strings.Split(logs.String(), "\n") {
+		switch {
+		case strings.Contains(line, `"error_kind":"upstream_redirect_loop"`):
+			loops++
+		case strings.Contains(line, `"error_kind":"upstream_redirect"`):
+			redirects++
+		}
+	}
+	if loops != 1 || redirects != 2 {
+		t.Fatalf("logs=%s", logs.String())
+	}
+	if errorsOf(t) != "gitrelay_upstream_errors_total 3" {
+		t.Fatal("rejected redirects did not increment upstream errors", errorsOf(t))
 	}
 }
