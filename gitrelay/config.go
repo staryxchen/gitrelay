@@ -16,6 +16,7 @@ type config struct {
 	RequestsPerSec  int
 	Burst           int
 	GitRequestBytes int64
+	AuthPassthrough bool
 }
 
 func loadConfig() (config, error) {
@@ -47,6 +48,13 @@ func loadConfig() (config, error) {
 			}
 			*dest = n
 		}
+	}
+	if value, ok := os.LookupEnv("ENABLE_AUTH_PASSTHROUGH"); ok {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return c, errors.New("ENABLE_AUTH_PASSTHROUGH must be a boolean (true or false)")
+		}
+		c.AuthPassthrough = enabled
 	}
 	host, portStr, err := net.SplitHostPort(c.Listen)
 	if err != nil {

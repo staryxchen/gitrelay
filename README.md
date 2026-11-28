@@ -35,12 +35,12 @@ gitrelay (方法拦截 -> 限流与并发槽 -> 路径规范化 -> 公网 IP 固
 github.com
 ```
 
-一次 `git clone` 会发两类请求，先 `GET /info/refs?service=git-upload-pack` 拿引用列表，再一次或多次 `POST /git-upload-pack` 协商并下载 packfile。`gitrelay` 校验 `owner` 和 `repo` 后，把上游地址统一重建为 `https://github.com/{owner}/{repo}.git/...` 再转发，过程中剥离 `Authorization`、`Cookie`、`Proxy-Authorization` 和 `Referer`。如果上游提前断流，服务端主动中止响应连接，避免客户端拿到残缺的包还以为下载完成。
+一次 `git clone` 会发两类请求，先 `GET /info/refs?service=git-upload-pack` 拿引用列表，再一次或多次 `POST /git-upload-pack` 协商并下载 packfile。`gitrelay` 校验 `owner` 和 `repo` 后，把上游地址统一重建为 `https://github.com/{owner}/{repo}.git/...` 再转发。服务默认剥离请求中的 `Authorization`、`Cookie`、`Proxy-Authorization`、`Referer` 以及响应中的 `WWW-Authenticate` 和 `Set-Cookie`。显式设置 `ENABLE_AUTH_PASSTHROUGH=true` 后，服务端在零凭据存储的前提下仅向 `https://github.com` 透传客户端 `Authorization`，并在上游返回 `401` 时原样返回 `WWW-Authenticate`，支持私密仓库克隆与拉取（配置见 [服务器部署](docs/deploy.md)）。如果上游提前断流，服务端主动中止响应连接，避免客户端拿到残缺的包还以为下载完成。
 
 ## 不支持
 
 - 除 `github.com` 以外的任何域名。
-- `git push`（`git-receive-pack`）、Git LFS 和私有仓库鉴权转发。
+- `git push`（`git-receive-pack`）、Git LFS 和服务端凭据存储。
 - Release 附件、源码 Archive 压缩包、`raw.githubusercontent.com` 文件和 GitHub 网页浏览。
 - HTTP `CONNECT` 正向隧道和上游 3xx 重定向跟随。
 - 本地磁盘缓存。

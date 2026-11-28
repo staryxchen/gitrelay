@@ -11,6 +11,7 @@
 | `REQUESTS_PER_SECOND` | `10` | 全局令牌桶每秒补充数，整数 `1` 到 `10000` |
 | `REQUEST_BURST` | `20` | 全局令牌桶突发容量，整数 `1` 到 `10000` |
 | `GIT_REQUEST_MAX_BYTES` | `33554432` | `POST /git-upload-pack` 压缩后请求体上限，默认 32 MiB，最大 1 GiB |
+| `ENABLE_AUTH_PASSTHROUGH` | `false` | 布尔值（Go `strconv.ParseBool`，如 `true`、`false`、`1`、`0`），空值或非法值拒绝启动。开启后仅向 `https://github.com` 透传 `Authorization`，并在上游 `401` 时原样返回 `WWW-Authenticate` |
 
 ## 常用排查命令
 
@@ -35,15 +36,17 @@ systemd-analyze cat-config systemd/journald.conf | grep -vE '^[[:space:]]*(#|$)'
 
 ## 日志字段
 
-每条请求向标准输出写一行 JSON。所有请求都包含 `method`、`status`、`req_bytes`、`resp_bytes` 和 `duration_ms`。
+服务启动时向标准输出写一条 `service started` JSON 日志，包含 `listen`、`version`、`commit`、`built` 和布尔字段 `auth_passthrough`。
+
+每条请求向标准输出写一行 `request` JSON 日志。所有请求都包含 `method`、`status`、`req_bytes`、`resp_bytes` 和 `duration_ms`。
 
 通过路径校验的 Git 请求会额外记录三个字段：
 
 - `action` 为 `info_refs` 或 `upload_pack`。
-- `repo` 为校验后的公开 `owner/repo`。
+- `repo` 为校验后的 `owner/repo`。
 - `upstream_ms` 为请求发出到收到 GitHub 响应头的毫秒数，对比 `duration_ms` 可以分清慢在 GitHub 上游还是客户端链路。
 
-发生拒绝或失败时附加 `error_kind`。日志不输出原始 URL、查询参数和请求头。
+发生拒绝或失败时附加 `error_kind`。请求日志与错误日志均不输出 `Authorization`、`Cookie`、原始 URL、查询参数和请求头。
 
 ## `/metrics` 指标
 

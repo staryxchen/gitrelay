@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -238,7 +239,7 @@ func (h *handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid upstream request", http.StatusBadRequest)
 		return
 	}
-	up.Header = forwardHeaders(r.Header, target.Action)
+	up.Header = forwardHeaders(r.Header, target.Action, target.UpstreamURL, h.cfg.AuthPassthrough)
 	if target.Action == actionUploadPack {
 		up.ContentLength = r.ContentLength
 	}
@@ -280,7 +281,7 @@ func (h *handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported upstream redirect", http.StatusBadGateway)
 		return
 	}
-	copyResponseHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w.Header(), resp.Header, resp.StatusCode, h.cfg.AuthPassthrough)
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(resp.StatusCode)
 	bufp := copyBufPool.Get().(*[]byte)
@@ -317,27 +318,39 @@ func (w *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func forwardHeaders(src http.Header, action gitAction) http.Header {
+func forwardHeaders(src http.Header, action gitAction, upstream *url.URL, allowAuth bool) http.Header {
 	h := make(http.Header)
-	allowed := []string{"Content-Type", "Git-Protocol", "Accept", "Accept-Encoding", "Cache-Control", "Pragma"}
-	if action == actionUploadPack {
-		allowed = append(allowed, "Content-Encoding")
-	}
-	for _, name := range allowed {
+	copyHeader := func(name string) {
 		for _, v := range src.Values(name) {
 			h.Add(name, v)
 		}
+	}
+	for _, name := range [...]string{"Content-Type", "Git-Protocol", "Accept", "Accept-Encoding", "Cache-Control", "Pragma"} {
+		copyHeader(name)
+	}
+	if action == actionUploadPack {
+		copyHeader("Content-Encoding")
+	}
+	if allowAuth && upstream != nil && upstream.Scheme == "https" && upstream.Host == allowedUpstreamHost {
+		copyHeader("Authorization")
 	}
 	stripHopHeaders(h, src)
 	h.Set("User-Agent", "gitrelay/1")
 	return h
 }
 
-func copyResponseHeaders(dst, src http.Header) {
-	for _, name := range []string{"Content-Type", "Content-Length", "Content-Encoding"} {
-		if values, ok := src[http.CanonicalHeaderKey(name)]; ok {
-			dst[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+func copyResponseHeaders(dst, src http.Header, statusCode int, allowAuth bool) {
+	copyHeader := func(name string) {
+		key := http.CanonicalHeaderKey(name)
+		if values, ok := src[key]; ok {
+			dst[key] = append([]string(nil), values...)
 		}
+	}
+	for _, name := range [...]string{"Content-Type", "Content-Length", "Content-Encoding"} {
+		copyHeader(name)
+	}
+	if allowAuth && statusCode == http.StatusUnauthorized {
+		copyHeader("WWW-Authenticate")
 	}
 	stripHopHeaders(dst, src)
 }

@@ -52,6 +52,7 @@ systemctl status gitrelay --no-pager
 - 将 `<ALLOWED_CLIENT_IP>` 替换为允许访问的固定出口 IP，多个 IP 用空格分隔。
 - 站点块用 `handle @allowed { ... } handle { abort }` 实现默认拒绝，非白名单 IP 会被直接断开。
 - `/healthz` 和 `/metrics` 对公网返回 `404`，只在本机调试查看。
+- `log` 块保持 `level ERROR`，并通过 `format filter` 删除 `request>headers>Authorization`、`request>headers>Cookie`、`request>headers>Proxy-Authorization` 与 `resp_headers>Set-Cookie`，防止错误日志记录客户端凭据。
 - `flush_interval -1` 必须保留，防止反代缓冲大仓库 packfile 或拖慢 Git 进度输出。如果前端用的是 Nginx，对应设置 `proxy_buffering off;` 并用 `allow <IP>; deny all;` 限制来源 IP。
 
 改完后先备份并校验，不要直接重启线上 Caddy：
@@ -192,3 +193,83 @@ systemctl restart gitrelay
 )
 systemctl is-active --quiet gitrelay
 ```
+
+## 6. 访问私密仓库（可选）
+
+`gitrelay` 默认剥离一切认证头，也不在服务端保存任何 GitHub PAT。如果需要通过中继克隆或拉取私密仓库，必须在服务端显式开启 `ENABLE_AUTH_PASSTHROUGH=true`，并确认宿主机 Caddy 已启用敏感头日志脱敏。开启后 `git push`（`git-receive-pack`）依然会被 `400` 拒绝，中继保持只读。建议为客户端创建仅勾选目标仓库 `Contents: Read-only` 权限的 Fine-grained PAT。
+
+### 6.1 核查宿主机 Caddy 日志脱敏并重载
+
+开启凭据透传前，先确认 `/etc/caddy/Caddyfile` 中 `relay.example.com` 的 `log` 块已包含 `deploy/gitrelay.caddy` 中的 `format filter` 规则。重载前后执行以下命令校验语法与适配后的 JSON 配置：
+
+```sh
+caddy validate --config /etc/caddy/Caddyfile
+caddy adapt --config /etc/caddy/Caddyfile --pretty
+```
+
+在 `caddy adapt` 输出的 JSON 中核对两项内容：
+
+- 全局 `apps.http.servers` 未启用 `"log_credentials": true`。此项不可省略：站点块内的 `format filter` 只作用于 `http.log.access`，而 `reverse_proxy` 连接后端失败（如 `gitrelay` 重启期间触发 `502`）还会向默认 logger 写入 `http.log.error`，该通道依赖 `log_credentials` 保持关闭将 `Authorization` 与 `Cookie` 替换为 `REDACTED`。
+- 站点日志编码器包含 `filter` 规则，且将 `request>headers>Authorization`、`request>headers>Cookie`、`request>headers>Proxy-Authorization` 与 `resp_headers>Set-Cookie`（JSON 输出中 `>` 会转义为 `\u003e`）全部设为 `delete`。
+
+确认无误后热重载 Caddy，并复查配置与运行状态：
+
+```sh
+systemctl reload caddy
+caddy validate --config /etc/caddy/Caddyfile
+systemctl is-active --quiet caddy
+```
+
+### 6.2 开启 `ENABLE_AUTH_PASSTHROUGH` 并核对启动日志
+
+在 `/etc/gitrelay/gitrelay.env` 中写入 `ENABLE_AUTH_PASSTHROUGH=true`，重启 `gitrelay` 并检查启动日志：
+
+```sh
+mkdir -p /etc/gitrelay
+touch /etc/gitrelay/gitrelay.env
+if grep -q '^ENABLE_AUTH_PASSTHROUGH=' /etc/gitrelay/gitrelay.env; then
+  sed -i 's/^ENABLE_AUTH_PASSTHROUGH=.*/ENABLE_AUTH_PASSTHROUGH=true/' /etc/gitrelay/gitrelay.env
+else
+  echo 'ENABLE_AUTH_PASSTHROUGH=true' >> /etc/gitrelay/gitrelay.env
+fi
+systemctl restart gitrelay
+journalctl -u gitrelay -n 20 --no-pager | grep '"auth_passthrough":true'
+```
+
+看到 `service started` 日志包含 `"auth_passthrough":true` 即表示透传已生效。
+
+### 6.3 配置客户端 `credential.helper` 与拉取私密仓库
+
+私密仓库的克隆和增量拉取命令与公开仓库一致：
+
+```sh
+git clone https://relay.example.com/https://github.com/OWNER/PRIVATE_REPO
+git -C PRIVATE_REPO fetch --prune
+```
+
+注意 `git` 按外层 HTTP 站点索引凭据，调用 `credential.helper` 时传入的 `host` 是 `relay.example.com`，而不是 `github.com`。首次未携带凭据请求私密仓库时，GitHub 返回 `401` 与 `WWW-Authenticate`，`gitrelay` 原样传回该质询以触发本地 `credential.helper`。可按使用场景选择以下任一配置方式：
+
+- **桌面端或交互式凭据辅助器**：为 `https://relay.example.com` 绑定系统钥匙串或内存缓存辅助器（如 macOS 的 `osxkeychain`、Windows 的 `manager`、Linux 的 `libsecret` 或 `cache`）。首次 `git clone` 弹出提示时，用户名填 `x-access-token`，密码填只读 Fine-grained PAT：
+
+```sh
+git config --global credential.https://relay.example.com.helper cache
+git clone https://relay.example.com/https://github.com/OWNER/PRIVATE_REPO
+```
+
+- **复用本地 `gh` CLI 登录态**：因为 `git` 查询的 `host` 为 `relay.example.com`，而 `gh auth login` 默认将令牌保存在 `github.com` 名下，直接执行 `git config --global credential.https://relay.example.com.helper '!gh auth git-credential'` 会因主机名不匹配而查不到凭据。可通过内联函数将查询主机指定为 `github.com` 后交给 `gh auth git-credential`：
+
+```sh
+git config --global credential.https://relay.example.com.helper \
+  '!f() { [ "$1" = get ] && printf "%s\n" protocol=https host=github.com "" | gh auth git-credential get; }; f'
+```
+
+- **CI 或脚本无交互内存辅助器**：通过 `GIT_TERMINAL_PROMPT=0` 禁用终端交互提示，并用单次 `-c` 内存辅助器从环境变量读取只读 PAT。保持 `-c` 参数使用单引号包裹，避免令牌在命令行参数中展开，也不会把 PAT 写入 `.git/config` 或磁盘文件：
+
+```sh
+export GITHUB_PAT="<READONLY_PAT>"
+GIT_TERMINAL_PROMPT=0 git \
+  -c 'credential.https://relay.example.com.helper=!f() { [ "$1" = get ] && printf "%s\n" "username=x-access-token" "password=${GITHUB_PAT}"; }; f' \
+  clone https://relay.example.com/https://github.com/OWNER/PRIVATE_REPO
+```
+
+不要将明文 PAT 写入外层地址（`https://user:<PAT>@relay.example.com/...`）或全局 `http.extraHeader`，否则凭据会落盘到本地 `.git/config` 或误发给其他仓库。内层 URL 内嵌凭据、路径前缀携带 Token、自定义请求头与服务端常驻 PAT 均不受支持，具体取舍见 [架构设计与核心取舍（ADR-5）](design.md#adr-5-零服务端凭据原则与标准-http-认证透传)。

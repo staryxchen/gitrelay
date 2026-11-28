@@ -71,9 +71,31 @@ func proxyRequest(t *testing.T, h http.Handler, method, path string, headers htt
 }
 
 const (
-	infoRefsPath   = "/https://github.com/o/r.git/info/refs?service=git-upload-pack"
-	uploadPackPath = "/https://github.com/o/r.git/git-upload-pack"
+	infoRefsPath          = "/https://github.com/o/r.git/info/refs?service=git-upload-pack"
+	uploadPackPath        = "/https://github.com/o/r.git/git-upload-pack"
+	sentinelToken         = "ghp_sentinel"
+	sentinelEncoded       = "eC1hY2Nlc3MtdG9rZW46Z2hwX3NlbnRpbmVs"
+	sentinelAuthorization = "Basic " + sentinelEncoded
 )
+
+func scriptUpstream(status int, respHdr http.Header, body string, saw func(*http.Request)) *http.Client {
+	return &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if saw != nil {
+				saw(r)
+			}
+			hdr := make(http.Header, len(respHdr))
+			for key, values := range respHdr {
+				hdr[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+			}
+			return &http.Response{
+				StatusCode: status, Header: hdr, Body: io.NopCloser(strings.NewReader(body)),
+				ContentLength: int64(len(body)), Request: r,
+			}, nil
+		}),
+	}
+}
 
 func TestProxyStripsCredentialsAndForwardsCompressionOpaquely(t *testing.T) {
 	var gzBody bytes.Buffer
@@ -368,5 +390,125 @@ func TestLargeStreamWithoutWholeObjectBuffer(t *testing.T) {
 	resp.Body.Close()
 	if err != nil || n != size {
 		t.Fatal("large stream truncated", n, err)
+	}
+}
+
+func TestAuthPassthroughHeaders(t *testing.T) {
+	challenges := []string{`Basic realm="GitHub"`, `Bearer realm="GitHub"`}
+	upstreamHdr := http.Header{"WWW-Authenticate": challenges, "Set-Cookie": {"session=secret"}}
+	clientHeaders := http.Header{
+		"Authorization": {sentinelAuthorization}, "Cookie": {"session=secret"},
+		"Proxy-Authorization": {"Basic secret"}, "Referer": {"https://internal.example"},
+	}
+	for _, tt := range []struct {
+		name                                string
+		allow, hop, wantAuth, wantChallenge bool
+		status                              int
+	}{
+		{"disabled", false, false, false, false, http.StatusUnauthorized},
+		{"challenge", true, false, true, true, http.StatusUnauthorized},
+		{"ok", true, false, true, false, http.StatusOK},
+		{"forbidden", true, false, true, false, http.StatusForbidden},
+		{"server_error", true, false, true, false, http.StatusInternalServerError},
+		{"connection_hop", true, true, false, false, http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := scriptUpstream(tt.status, upstreamHdr, "body", func(r *http.Request) {
+				gotAuth := r.Header.Values("Authorization")
+				switch {
+				case tt.wantAuth && (len(gotAuth) != 1 || gotAuth[0] != sentinelAuthorization):
+					t.Errorf("Authorization = %#v", gotAuth)
+				case !tt.wantAuth && len(gotAuth) != 0:
+					t.Errorf("Authorization = %#v", gotAuth)
+				}
+				if r.Header.Get("Cookie") != "" || r.Header.Get("Proxy-Authorization") != "" || r.Header.Get("Referer") != "" {
+					t.Error("stripped request headers forwarded")
+				}
+			})
+			cfg := testConfig()
+			cfg.AuthPassthrough = tt.allow
+			hdr := clientHeaders.Clone()
+			if tt.hop {
+				hdr.Set("Connection", "Authorization")
+			}
+			got := proxyRequest(t, newHandler(cfg, handlerOptions{Client: client}), "GET", infoRefsPath, hdr, "")
+			if got.Code != tt.status {
+				t.Fatalf("code=%d body=%s", got.Code, got.Body.String())
+			}
+			vals := got.Header().Values("WWW-Authenticate")
+			if tt.wantChallenge {
+				if len(vals) != 2 || vals[0] != challenges[0] || vals[1] != challenges[1] {
+					t.Fatalf("WWW-Authenticate = %#v", vals)
+				}
+			} else if len(vals) != 0 {
+				t.Fatalf("WWW-Authenticate = %#v", vals)
+			}
+			if got.Header().Get("Set-Cookie") != "" || got.Header().Get("Cache-Control") != "private, no-store" {
+				t.Fatalf("Set-Cookie=%q Cache-Control=%q", got.Header().Get("Set-Cookie"), got.Header().Get("Cache-Control"))
+			}
+		})
+	}
+}
+
+func TestForwardHeadersRejectsUntrustedUpstream(t *testing.T) {
+	src := http.Header{"Authorization": {sentinelAuthorization, "Bearer second"}}
+	for _, upstream := range []*url.URL{
+		nil,
+		{Scheme: "http", Host: "github.com"},
+		{Scheme: "https", Host: "evil.example"},
+	} {
+		got := forwardHeaders(src, actionInfoRefs, upstream, true)
+		if got.Get("Authorization") != "" {
+			t.Errorf("upstream=%v Authorization=%q", upstream, got.Get("Authorization"))
+		}
+	}
+	trusted := &url.URL{Scheme: "https", Host: "github.com"}
+	got := forwardHeaders(src, actionInfoRefs, trusted, true)
+	if vals := got.Values("Authorization"); len(vals) != 2 || vals[0] != sentinelAuthorization || vals[1] != "Bearer second" {
+		t.Fatalf("trusted Authorization=%#v", vals)
+	}
+	if denied := forwardHeaders(src, actionInfoRefs, trusted, false); denied.Get("Authorization") != "" {
+		t.Fatalf("allowAuth false Authorization=%q", denied.Get("Authorization"))
+	}
+}
+
+func TestSentinelCredentialAbsentFromLogsAndErrors(t *testing.T) {
+	auth := http.Header{"Authorization": {sentinelAuthorization}}
+	noUpstream := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("unexpected upstream call")
+		return nil, errors.New("unexpected upstream call")
+	})}
+	sentinelErr := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial " + sentinelToken + " " + sentinelEncoded)
+	})}
+	for _, tt := range []struct {
+		name, path, body, log string
+		client                *http.Client
+		want                  int
+	}{
+		{"400", "/https://github.com/o/r/archive/refs/heads/main.zip", "", "", noUpstream, http.StatusBadRequest},
+		{"401", infoRefsPath, "", "", scriptUpstream(http.StatusUnauthorized, http.Header{"WWW-Authenticate": {`Basic realm="GitHub"`}}, "unauthorized", nil), http.StatusUnauthorized},
+		{"500", infoRefsPath, "", `"msg":"upstream error response"`, scriptUpstream(http.StatusInternalServerError, nil, "upstream", nil), http.StatusInternalServerError},
+		{"502_upstream_error", infoRefsPath, "upstream request failed\n", `"msg":"upstream request failed"`, sentinelErr, http.StatusBadGateway},
+		{"502_redirect", infoRefsPath, "unsupported upstream redirect\n", "", scriptUpstream(http.StatusFound, http.Header{"Location": {"https://github.com/o/new.git/info/refs?service=git-upload-pack"}}, "redirected", nil), http.StatusBadGateway},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.AuthPassthrough = true
+			var logs bytes.Buffer
+			h := newHandler(cfg, handlerOptions{Client: tt.client, Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+			got := proxyRequest(t, h, http.MethodGet, tt.path, auth, "")
+			if got.Code != tt.want || (tt.body != "" && got.Body.String() != tt.body) {
+				t.Fatalf("code=%d body=%q", got.Code, got.Body.String())
+			}
+			text := logs.String()
+			if !strings.Contains(text, `"msg":"request"`) || (tt.log != "" && !strings.Contains(text, tt.log)) {
+				t.Fatalf("logs=%s", text)
+			}
+			blob := text + got.Body.String() + fmt.Sprint(got.Header())
+			if strings.Contains(blob, sentinelToken) || strings.Contains(blob, sentinelEncoded) {
+				t.Fatalf("credential leaked status=%d logs=%s body=%q headers=%v", got.Code, text, got.Body.String(), got.Header())
+			}
+		})
 	}
 }
