@@ -13,6 +13,8 @@ const allowedUpstreamHost = "github.com"
 var (
 	ownerPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,38}$`)
 	repoPattern  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+
+	errRedirectLoop = errors.New("upstream redirect loop")
 )
 
 type gitAction uint8
@@ -29,6 +31,10 @@ type target struct {
 	UpstreamURL *url.URL
 }
 
+func (t target) RelayPath() string {
+	return "/" + t.UpstreamURL.String()
+}
+
 func parseTarget(method, escapedPath, rawQuery string) (target, error) {
 	raw := strings.TrimPrefix(escapedPath, "/")
 	if strings.HasPrefix(raw, "https:/") && !strings.HasPrefix(raw, "https://") {
@@ -41,6 +47,10 @@ func parseTarget(method, escapedPath, rawQuery string) (target, error) {
 	if err != nil {
 		return target{}, errors.New("invalid upstream URL")
 	}
+	return parseUpstreamURL(method, u)
+}
+
+func parseUpstreamURL(method string, u *url.URL) (target, error) {
 	if u.Scheme != "https" || u.Opaque != "" || u.User != nil ||
 		u.Fragment != "" || u.Host != allowedUpstreamHost ||
 		strings.ContainsAny(u.Path, "\\\x00\r\n") {
@@ -89,4 +99,37 @@ func parseTarget(method, escapedPath, rawQuery string) (target, error) {
 		}, nil
 	}
 	return target{}, errors.New("unsupported GitHub path or HTTP method")
+}
+
+func parseRedirectTarget(current target, statusCode int, locations []string) (target, error) {
+	switch statusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+	default:
+		return target{}, errors.New("unsupported upstream redirect")
+	}
+	if current.Action != actionInfoRefs || len(locations) != 1 {
+		return target{}, errors.New("unsupported upstream redirect")
+	}
+	raw := locations[0]
+	if raw == "" || strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, "#\\\x00\r\n") {
+		return target{}, errors.New("unsupported upstream redirect")
+	}
+	absolute := raw
+	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
+		absolute = "https://" + allowedUpstreamHost + raw
+	} else if !strings.HasPrefix(raw, "https://") {
+		return target{}, errors.New("unsupported upstream redirect")
+	}
+	u, err := url.Parse(absolute)
+	if err != nil {
+		return target{}, errors.New("unsupported upstream redirect")
+	}
+	next, err := parseUpstreamURL(http.MethodGet, u)
+	if err != nil {
+		return target{}, err
+	}
+	if next.UpstreamURL.String() == current.UpstreamURL.String() {
+		return target{}, errRedirectLoop
+	}
+	return next, nil
 }

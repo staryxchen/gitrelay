@@ -48,6 +48,8 @@ systemd-analyze cat-config systemd/journald.conf | grep -vE '^[[:space:]]*(#|$)'
 
 发生拒绝或失败时附加 `error_kind`。请求日志与错误日志均不输出 `Authorization`、`Cookie`、原始 URL、查询参数和请求头。
 
+`error_kind` 为 `upstream_redirect` 时，上游 `3xx` 未通过 `info/refs` 重定向校验，响应为 `502`。`error_kind` 为 `upstream_redirect_loop` 时，`Location` 规范化后与当前 `info/refs` 地址相同，响应同样为 `502`。这两种日志都不包含 `Location`。校验通过并改写的 `301`、`302`、`307`、`308` 不设置 `error_kind`。
+
 ## `/metrics` 指标
 
 `/metrics` 仅在回环地址访问，输出标准 Prometheus 文本格式。所有指标都是固定的 `atomic.Int64` 标量，没有按仓库或 IP 展开的动态标签，内存占用固定：
@@ -60,7 +62,7 @@ systemd-analyze cat-config systemd/journald.conf | grep -vE '^[[:space:]]*(#|$)'
 | `gitrelay_active_requests` | gauge | 当前正在处理的请求数 |
 | `gitrelay_request_bytes_total` | counter | 上行 `git-upload-pack` 累计字节数 |
 | `gitrelay_response_bytes_total` | counter | 下行响应累计字节数 |
-| `gitrelay_upstream_errors_total` | counter | 上游失败、5xx、重定向拒绝和断流次数 |
+| `gitrelay_upstream_errors_total` | counter | 上游失败、5xx、被拒绝的重定向、重定向自环和断流次数。校验通过的 `info/refs` 重定向不计入 |
 | `gitrelay_client_aborts_total` | counter | 客户端主动取消或断连次数 |
 | `gitrelay_rejected_rate_limit_total` | counter | 触发令牌桶限流返回 `429` 次数 |
 | `gitrelay_rejected_concurrency_total` | counter | 触发并发上限返回 `429` 次数 |

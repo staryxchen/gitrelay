@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRealGitCloneFetchAndCompatibility(t *testing.T) {
@@ -308,4 +310,275 @@ func TestRealGitAuthPassthrough(t *testing.T) {
 		t.Fatalf("push receivePack=%d logs=%s", receivePack.Load(), text)
 	}
 	omit(text, authPAT)
+}
+
+type upstreamHit struct {
+	method, path, host, auth string
+}
+
+func TestRealGitRedirectRenameAndSecurity(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git executable not installed; protocol boundary tests still run")
+	}
+	const authUser, authPAT = "x-access-token", "ghp_redirect_secret"
+	validAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(authUser+":"+authPAT))
+	cred := func(key string) string {
+		return `!f() { if [ "$1" = get ]; then printf "username=x-access-token\npassword=%s\n" "$` + key + `"; fi; }; f`
+	}
+	env := append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_TERMINAL_PROMPT=0", "TEST_PAT="+authPAT)
+	runGit := func(t *testing.T, timeout time.Duration, wantOK bool, args ...string) string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, git, args...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil {
+			t.Fatalf("git %v timed out: %v\n%s", args, ctx.Err(), out)
+		}
+		if wantOK != (err == nil) {
+			t.Fatalf("git %v ok=%v: %v\n%s", args, wantOK, err, out)
+		}
+		return string(out)
+	}
+	backend := filepath.Join(strings.TrimSpace(runGit(t, 30*time.Second, true, "--exec-path")), "git-http-backend")
+	if _, err := os.Stat(backend); err != nil {
+		t.Skip("git-http-backend is not installed")
+	}
+	root, seed := t.TempDir(), t.TempDir()
+	newBare := filepath.Join(root, "neworg", "newrepo.git")
+	privBare := filepath.Join(root, "neworg", "priv.git")
+	runGit(t, 30*time.Second, true, "init", "--bare", "--template=", newBare)
+	runGit(t, 30*time.Second, true, "init", "--bare", "--template=", privBare)
+	runGit(t, 30*time.Second, true, "init", "--template=", seed)
+	runGit(t, 30*time.Second, true, "-C", seed, "checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(seed, "file.txt"), []byte("redirect-v1"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, 30*time.Second, true, "-C", seed, "add", "file.txt")
+	runGit(t, 30*time.Second, true, "-C", seed, "-c", "user.name=Gitrelay Test", "-c", "user.email=test@example.invalid",
+		"-c", "core.hooksPath="+os.DevNull, "commit", "--no-gpg-sign", "-m", "init")
+	runGit(t, 30*time.Second, true, "-C", seed, "push", newBare, "HEAD:main")
+	runGit(t, 30*time.Second, true, "-C", seed, "push", privBare, "HEAD:main")
+	runGit(t, 30*time.Second, true, "--git-dir="+newBare, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGit(t, 30*time.Second, true, "--git-dir="+privBare, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	redirects := map[string]struct {
+		status int
+		loc    string
+	}{
+		"/oldorg/oldrepo.git/info/refs": {http.StatusMovedPermanently, "https://github.com/neworg/newrepo.git/info/refs?service=git-upload-pack"},
+		"/hop1/r.git/info/refs":         {http.StatusMovedPermanently, "https://github.com/hop2/r.git/info/refs?service=git-upload-pack"},
+		"/hop2/r.git/info/refs":         {http.StatusFound, "https://github.com/neworg/newrepo.git/info/refs?service=git-upload-pack"},
+		"/self/r.git/info/refs":         {http.StatusMovedPermanently, "https://github.com/self/r.git/info/refs?service=git-upload-pack"},
+		"/loopa/r.git/info/refs":        {http.StatusFound, "https://github.com/loopb/r.git/info/refs?service=git-upload-pack"},
+		"/loopb/r.git/info/refs":        {http.StatusFound, "https://github.com/loopa/r.git/info/refs?service=git-upload-pack"},
+		"/evil/r.git/info/refs":         {http.StatusFound, "https://evil.example/offhost/leak.git/info/refs?service=git-upload-pack"},
+		"/oldorg/priv.git/info/refs":    {http.StatusMovedPermanently, "https://github.com/neworg/priv.git/info/refs?service=git-upload-pack"},
+	}
+	var hitMu sync.Mutex
+	var hits []upstreamHit
+	resetHits := func() {
+		hitMu.Lock()
+		hits = nil
+		hitMu.Unlock()
+	}
+	snapshot := func() []upstreamHit {
+		hitMu.Lock()
+		defer hitMu.Unlock()
+		out := make([]upstreamHit, len(hits))
+		copy(out, hits)
+		return out
+	}
+	serveGit := func(w http.ResponseWriter, r *http.Request) {
+		(&cgi.Handler{Path: backend, Root: "/", Dir: root, Env: []string{
+			"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1", "GIT_PROTOCOL=" + r.Header.Get("Git-Protocol"),
+		}}).ServeHTTP(w, r)
+	}
+	client := localUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		hitMu.Lock()
+		hits = append(hits, upstreamHit{r.Method, r.URL.Path, r.Host, r.Header.Get("Authorization")})
+		hitMu.Unlock()
+		if spec, ok := redirects[r.URL.Path]; ok && r.URL.RawQuery == "service=git-upload-pack" {
+			w.Header().Set("Location", spec.loc)
+			w.WriteHeader(spec.status)
+			w.Write([]byte("redirect-body"))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/neworg/priv.git/") && r.Header.Get("Authorization") != validAuth {
+			w.Header().Set("WWW-Authenticate", `Basic realm="GitHub"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/neworg/newrepo.git/") || strings.HasPrefix(r.URL.Path, "/neworg/priv.git/") {
+			serveGit(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	start := func(t *testing.T, mutate func(*config)) (*httptest.Server, *syncBuffer) {
+		t.Helper()
+		logs := &syncBuffer{}
+		cfg := testConfig()
+		cfg.GitRequestBytes = 1 << 20
+		if mutate != nil {
+			mutate(&cfg)
+		}
+		proxy := httptest.NewServer(newHandler(cfg, handlerOptions{
+			Client: client, Logger: slog.New(slog.NewJSONHandler(logs, nil)),
+		}))
+		t.Cleanup(proxy.Close)
+		return proxy, logs
+	}
+	omitPAT := func(t *testing.T, text string) {
+		t.Helper()
+		for _, secret := range []string{
+			authPAT,
+			base64.StdEncoding.EncodeToString([]byte(authPAT)),
+			base64.StdEncoding.EncodeToString([]byte(authUser + ":" + authPAT)),
+		} {
+			if strings.Contains(text, secret) {
+				t.Fatal("credential appeared in logs or output")
+			}
+		}
+	}
+	assertPosts := func(t *testing.T, repo string) {
+		t.Helper()
+		got := snapshot()
+		posts := 0
+		for _, hit := range got {
+			if hit.method != http.MethodPost {
+				continue
+			}
+			posts++
+			if hit.path != repo || strings.Contains(hit.host, "evil.example") {
+				t.Fatalf("POST path=%s host=%s hits=%+v", hit.path, hit.host, got)
+			}
+		}
+		if posts == 0 {
+			t.Fatalf("no POST, hits=%+v", got)
+		}
+	}
+
+	proxy, _ := start(t, nil)
+	work := t.TempDir()
+	reused := filepath.Join(work, "bare")
+	for _, tc := range []struct {
+		name, raw string
+		gets      []string
+	}{
+		{"bare", "/https://github.com/oldorg/oldrepo", []string{"/oldorg/oldrepo.git/info/refs"}},
+		{"collapsed", "/https:/github.com/oldorg/oldrepo", []string{"/oldorg/oldrepo.git/info/refs"}},
+		{"two_hop", "/https://github.com/hop1/r", []string{"/hop1/r.git/info/refs", "/hop2/r.git/info/refs"}},
+	} {
+		t.Run("clone/"+tc.name, func(t *testing.T) {
+			resetHits()
+			dst := filepath.Join(work, tc.name)
+			runGit(t, 30*time.Second, true, "clone", "--quiet", proxy.URL+tc.raw, dst)
+			data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+			if err != nil || string(data) != "redirect-v1" {
+				t.Fatalf("content=%q err=%v", data, err)
+			}
+			got := snapshot()
+			saw := make(map[string]bool, len(got))
+			for _, hit := range got {
+				if hit.method == http.MethodGet {
+					saw[hit.path] = true
+				}
+			}
+			for _, path := range tc.gets {
+				if !saw[path] {
+					t.Fatalf("missing GET %s hits=%+v", path, got)
+				}
+			}
+			assertPosts(t, "/neworg/newrepo.git/git-upload-pack")
+		})
+	}
+
+	t.Run("fetch", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(seed, "file.txt"), []byte("redirect-v2"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, 30*time.Second, true, "-C", seed, "add", "file.txt")
+		runGit(t, 30*time.Second, true, "-C", seed, "-c", "user.name=Gitrelay Test", "-c", "user.email=test@example.invalid",
+			"-c", "core.hooksPath="+os.DevNull, "commit", "--no-gpg-sign", "-m", "update")
+		runGit(t, 30*time.Second, true, "-C", seed, "push", newBare, "HEAD:main")
+		resetHits()
+		runGit(t, 30*time.Second, true, "-C", reused, "fetch", "origin")
+		if content := strings.TrimSpace(runGit(t, 30*time.Second, true, "-C", reused, "show", "origin/main:file.txt")); content != "redirect-v2" {
+			t.Fatalf("fetch content=%q", content)
+		}
+		assertPosts(t, "/neworg/newrepo.git/git-upload-pack")
+	})
+
+	t.Run("self_loop", func(t *testing.T) {
+		resetHits()
+		loopProxy, logs := start(t, nil)
+		out := runGit(t, 30*time.Second, false, "clone", loopProxy.URL+"/https://github.com/self/r", filepath.Join(t.TempDir(), "self"))
+		got := snapshot()
+		if len(got) != 1 || got[0].method != http.MethodGet || got[0].path != "/self/r.git/info/refs" {
+			t.Fatalf("hits=%+v out=%s", got, out)
+		}
+		if !strings.Contains(out, "502") || !strings.Contains(logs.String(), `"error_kind":"upstream_redirect_loop"`) {
+			t.Fatalf("out=%s logs=%s", out, logs.String())
+		}
+	})
+
+	t.Run("cycle", func(t *testing.T) {
+		resetHits()
+		out := runGit(t, 30*time.Second, false, "clone", proxy.URL+"/https://github.com/loopa/r", filepath.Join(t.TempDir(), "cycle"))
+		if !strings.Contains(strings.ToLower(out), "redirect") {
+			t.Fatalf("out=%s", out)
+		}
+		if n := len(snapshot()); n == 0 || n > 25 {
+			t.Fatalf("upstream calls=%d out=%s", n, out)
+		}
+	})
+
+	t.Run("cross_host", func(t *testing.T) {
+		resetHits()
+		crossProxy, logs := start(t, func(cfg *config) { cfg.AuthPassthrough = true })
+		out := runGit(t, 30*time.Second, false, "-c", "http.extraHeader=Authorization: "+validAuth,
+			"clone", crossProxy.URL+"/https://github.com/evil/r", filepath.Join(t.TempDir(), "evil"))
+		got := snapshot()
+		if len(got) != 1 || got[0].method != http.MethodGet || got[0].path != "/evil/r.git/info/refs" || got[0].auth != validAuth || strings.Contains(got[0].host, "evil.example") {
+			t.Fatalf("hits=%+v out=%s", got, out)
+		}
+		blob := logs.String() + out
+		omitPAT(t, blob)
+		if strings.Contains(blob, "evil.example") || strings.Contains(blob, "offhost") {
+			t.Fatalf("off-host redirect leaked out=%s logs=%s", out, logs.String())
+		}
+		if !strings.Contains(out, "502") || !strings.Contains(logs.String(), `"error_kind":"upstream_redirect"`) {
+			t.Fatalf("out=%s logs=%s", out, logs.String())
+		}
+	})
+
+	t.Run("private_helper", func(t *testing.T) {
+		resetHits()
+		proxy, logs := start(t, func(cfg *config) { cfg.AuthPassthrough = true })
+		dst := filepath.Join(t.TempDir(), "priv")
+		runGit(t, 30*time.Second, true, "-c", "credential.helper="+cred("TEST_PAT"), "clone", "--quiet", proxy.URL+"/https://github.com/oldorg/priv", dst)
+		data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+		if err != nil || string(data) != "redirect-v1" {
+			t.Fatalf("content=%q err=%v", data, err)
+		}
+		var sawOld, sawChallenge, sawAuthed bool
+		for _, hit := range snapshot() {
+			switch {
+			case hit.path == "/oldorg/priv.git/info/refs":
+				sawOld = true
+			case strings.HasPrefix(hit.path, "/neworg/priv.git/") && hit.auth == "":
+				sawChallenge = true
+			case hit.method == http.MethodPost && hit.path == "/neworg/priv.git/git-upload-pack" && hit.auth == validAuth:
+				sawAuthed = true
+			}
+		}
+		if !sawOld || !sawChallenge || !sawAuthed {
+			t.Fatalf("hits=%+v", snapshot())
+		}
+		omitPAT(t, logs.String())
+	})
 }
